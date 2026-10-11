@@ -128,6 +128,10 @@ Werte lassen sich später auch im Dashboard ändern.
 - **Eine private Datenbank.** Nutzer, Suchen, das Meldungsprotokoll, Einstellungen und Dashboard-Sitzungen
   liegen in `bot.db` im `DATA_DIR`. Der Bot legt sie so an, dass nur sein eigener Nutzer sie lesen und
   schreiben kann; dasselbe gilt für die täglichen Kopien in `backups/`.
+- **Keine SQL-Injection.** Namen, Suchbegriffe und Nachrichten gehen immer als Werte an die Datenbank, nie als
+  Teil einer Anweisung - Anführungszeichen und SQL darin werden also als reiner Text gespeichert. Zusätzlich
+  lehnt die geöffnete Datenbank alles ab außer dem Lesen und Schreiben der eigenen Zeilen des Bots: kein
+  Löschen oder Ändern von Tabellen, kein Einbinden anderer Dateien.
 - **Gehashtes Dashboard-Passwort.** Statt `ADMIN_PASSWORD` kannst du `ADMIN_PASSWORD_HASH` setzen. Erzeuge
   den Hash mit dem Bot selbst und füg die ausgegebene Zeile in deine `.env` ein:
 

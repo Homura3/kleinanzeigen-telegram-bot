@@ -233,6 +233,40 @@ db = {"con": None, "rows": {}}      # the open database, and its rows as they we
 db_lock = threading.Lock()
 
 
+# Against SQL injection, three things hold together:
+# 1. The statements are put together once, here, from the fixed names in TABLES. Nothing a person can
+#    type ever becomes part of a statement.
+# 2. Every value - names, search words, messages - is handed to the database separately (the ? marks),
+#    so it is stored as it is, quotes and all, and never read as SQL.
+# 3. guard() below: the open database only reads and writes rows of the bot's own tables. Dropping or
+#    altering a table, attaching another file or changing a setting is refused, whoever asks.
+def statements():
+    """For each table: read all rows, delete one row, write one row."""
+    out = {}
+    for table, (columns, keys) in TABLES.items():
+        if not all(re.fullmatch(r"[a-z_]+", name) for name in (table,) + columns):
+            raise ValueError("odd name in the table list: " + table)
+        out[table] = ("SELECT %s FROM %s" % (", ".join(columns), table),
+                      "DELETE FROM %s WHERE %s" % (table, " AND ".join(column + " = ?" for column in columns[:keys])),
+                      "INSERT OR REPLACE INTO %s (%s) VALUES (%s)" % (table, ", ".join(columns),
+                                                                      ", ".join("?" for _ in columns)))
+    return out
+
+
+SQL = statements()
+
+
+def guard(action, first, second, database, source):
+    """Asked by SQLite before a statement may do anything: yes to rows of our tables, no to all else."""
+    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_TRANSACTION):
+        return sqlite3.SQLITE_OK
+    if action in (sqlite3.SQLITE_READ, sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE):
+        return sqlite3.SQLITE_OK if first in TABLES or first == "audit" else sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_FUNCTION:
+        return sqlite3.SQLITE_OK if second == "max" else sqlite3.SQLITE_DENY     # the security log trims itself with it
+    return sqlite3.SQLITE_DENY
+
+
 def pack(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -250,12 +284,13 @@ def open_db():
     os.makedirs(DATA_DIR, exist_ok=True)
     con = sqlite3.connect(DB, check_same_thread=False, timeout=30)
     con.executescript(SCHEMA)
+    con.set_authorizer(guard)       # from here on the tables themselves cannot be touched
     try:
         os.chmod(DB, 0o600)
     except OSError as error:
         log("could not make the database private: " + safe(error))
     db["con"] = con
-    db["rows"] = {table: {row[:keys]: row for row in con.execute("SELECT %s FROM %s" % (", ".join(columns), table))}
+    db["rows"] = {table: {row[:keys]: row for row in con.execute(SQL[table][0])}
                   for table, (columns, keys) in TABLES.items()}
 
 
@@ -306,16 +341,14 @@ def save():
             return
         try:
             with con:       # one transaction: all of it lands, or none of it
-                for table, (columns, keys) in TABLES.items():
+                for table in TABLES:
                     before, after = db["rows"].get(table, {}), now[table]
                     gone = [key for key in before if key not in after]
                     changed = [row for key, row in after.items() if before.get(key) != row]
                     if gone:
-                        con.executemany("DELETE FROM %s WHERE %s" % (table, " AND ".join(
-                            column + " = ?" for column in columns[:keys])), gone)
+                        con.executemany(SQL[table][1], gone)
                     if changed:
-                        con.executemany("INSERT OR REPLACE INTO %s (%s) VALUES (%s)" % (
-                            table, ", ".join(columns), ", ".join("?" for _ in columns)), changed)
+                        con.executemany(SQL[table][2], changed)
             db["rows"] = now
         except sqlite3.Error as error:
             log("could not save to the database: " + safe(error))      # the next save tries again

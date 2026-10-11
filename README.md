@@ -133,6 +133,10 @@ values can also be changed later on the dashboard.
 - **One private database.** Users, searches, the alert log, settings and dashboard sessions are in
   `bot.db` inside `DATA_DIR`. The bot creates it readable and writable for its own user only, and the same
   goes for the daily copies in `backups/`.
+- **No SQL injection.** Names, search words and messages are always handed to the database as values, never
+  as part of a statement, so quotes and SQL in them are stored as plain text. On top of that the open
+  database refuses everything except reading and writing the bot's own rows: no dropping or altering
+  tables, no attaching other files.
 - **Hashed dashboard password.** Instead of `ADMIN_PASSWORD` you can set `ADMIN_PASSWORD_HASH`. Make the
   hash with the bot itself and paste the line it prints into your `.env`:
 
