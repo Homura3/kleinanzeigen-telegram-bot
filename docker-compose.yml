@@ -6,6 +6,17 @@ services:
     environment:
       DATA_DIR: /data
     volumes:
-      - ./data:/data
+      - ebbot-data:/data
     ports:
-      - "8080:8080"   # admin dashboard, only served when ADMIN_PASSWORD is set
+      - "8080:8080"   # admin dashboard, only served when a password is set
+    # nothing in the container can be changed except the data volume, and it holds no special rights
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  ebbot-data:

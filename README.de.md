@@ -6,8 +6,8 @@ und Englisch.
 
 🇬🇧 [English instructions](README.md)
 
-Der Bot besteht aus einer einzigen Python-Datei mit zwei Abhängigkeiten, speichert seine Daten in einfachen
-JSON-Dateien und läuft problemlos auf einem Raspberry Pi, einem NAS oder jedem kleinen Server.
+Der Bot besteht aus einer einzigen Python-Datei mit zwei Abhängigkeiten, speichert seine Daten in einer einzigen
+SQLite-Datenbank und läuft problemlos auf einem Raspberry Pi, einem NAS oder jedem kleinen Server.
 
 ![ebBot in Telegram: die /about-Nachricht und Meldungen über neue Anzeigen](docs/telegram.webp)
 
@@ -30,6 +30,9 @@ JSON-Dateien und läuft problemlos auf einem Raspberry Pi, einem NAS oder jedem 
   die zu zwei deiner Suchen passt, kommt nur einmal.
 - **Admin-Dashboard.** Eine passwortgeschützte Webseite, um Leute freizugeben, Nutzer und Suchen anzusehen
   und die Einstellungen des Bots zu ändern. Sie lässt sich auf dem Handy zum Startbildschirm hinzufügen.
+- **Sorgsam mit deinen Daten.** Alles liegt in einer Datenbankdatei, die nur der eigene Nutzer des Bots lesen
+  kann, und jeden Tag wird eine Kopie beiseitegelegt. Das Dashboard-Passwort lässt sich als Hash hinterlegen,
+  und ein Sicherheitsprotokoll zeigt Anmeldungen, Fehlversuche und Änderungen.
 - **Passt auf sich selbst auf.** Schlagen Scans fehl oder blockiert die Seite den Bot, wartet er länger ab
   und warnt den Admin - und meldet sich, wenn es wieder läuft.
 - **Deutsch und Englisch.** Jeder wählt mit `/language` seine eigene Sprache. Neue Nutzer starten in der
@@ -73,7 +76,9 @@ cp .env.example .env      # dann TOKEN, CHAT_ID und ADMIN_PASSWORD eintragen
 docker compose up -d --build
 ```
 
-Die Daten des Bots landen in `./data`. Das Dashboard erreichst du unter `http://<dein-server>:8080`.
+Die Daten des Bots liegen im Docker-Volume `ebbot-data`. Das Dashboard erreichst du unter
+`http://<dein-server>:8080`. Der Container läuft als unprivilegierter Nutzer auf einem schreibgeschützten
+Dateisystem.
 
 ### Ohne Docker
 
@@ -99,7 +104,8 @@ einen Admin hat.
 |---|---|---|
 | `TOKEN` | - | Bot-Token von @BotFather |
 | `CHAT_ID` | - | Telegram-Nutzer-ID des Admins |
-| `ADMIN_PASSWORD` | aus | Passwort für das Dashboard (mindestens 10 Zeichen). Leer schaltet das Dashboard aus |
+| `ADMIN_PASSWORD` | aus | Passwort für das Dashboard (mindestens 10 Zeichen). Ohne Passwort ist das Dashboard aus |
+| `ADMIN_PASSWORD_HASH` | - | Dasselbe Passwort als Hash, damit es nicht in deinen Einstellungen lesbar ist. Siehe [Sicherheit](#sicherheit) |
 | `ALLOWED_IDS` | - | Nutzer-IDs, die den Bot ohne Freigabe verwenden dürfen, durch Kommas getrennt |
 | `APPROVAL` | `1` | Neue Leute brauchen die Freigabe des Admins. `0` öffnet die Anmeldung für alle |
 | `INTERVAL` | `600` | Sekunden zwischen den Kleinanzeigen-Scans |
@@ -108,14 +114,37 @@ einen Admin hat.
 | `MAX_PER_CYCLE` | `10` | Höchstens so viele Meldungen pro Suche in einem Scan |
 | `ALERT_HOURS` | `24` | Stunden, bis Meldungen aus den Chats gelöscht werden. `0` behält sie; Telegram erlaubt höchstens 48 |
 | `LANGUAGE` | `en` | Ausweichsprache, `en` oder `de`: gilt für Leute, deren Telegram-App keine der beiden Sprachen hat, und für alle, die noch keine gewählt haben |
-| `DATA_DIR` | `~/ebbot` | Wo der Bot seine Daten ablegt (`/data` im Docker-Image) |
+| `DATA_DIR` | `~/ebbot` | Ordner für die Datenbank `bot.db` und ihre täglichen Kopien (`/data` im Docker-Image) |
+| `BACKUP_DAYS` | `7` | Wie viele tägliche Kopien der Datenbank in `backups/` aufbewahrt werden. `0` legt keine an |
 | `DASHBOARD_PORT` | `8080` | Port des Dashboards |
-| `EBAY_DATA_DIR` | - | Ordner für die eBay-Daten, zum Beispiel `/data/ebay` |
 | `EBAY_APP_ID`, `EBAY_CERT_ID` | - | Schlüssel von [developer.ebay.com](https://developer.ebay.com) |
 | `EBAY_INTERVAL` | `300` | Sekunden zwischen den eBay-Scans |
 
-eBay schaltet sich ein, sobald `EBAY_DATA_DIR`, `EBAY_APP_ID` und `EBAY_CERT_ID` gesetzt sind. Einige dieser
+eBay schaltet sich ein, sobald `EBAY_APP_ID` und `EBAY_CERT_ID` beide gesetzt sind. Einige dieser
 Werte lassen sich später auch im Dashboard ändern.
+
+## Sicherheit
+
+- **Eine private Datenbank.** Nutzer, Suchen, das Meldungsprotokoll, Einstellungen und Dashboard-Sitzungen
+  liegen in `bot.db` im `DATA_DIR`. Der Bot legt sie so an, dass nur sein eigener Nutzer sie lesen und
+  schreiben kann; dasselbe gilt für die täglichen Kopien in `backups/`.
+- **Gehashtes Dashboard-Passwort.** Statt `ADMIN_PASSWORD` kannst du `ADMIN_PASSWORD_HASH` setzen. Erzeuge
+  den Hash mit dem Bot selbst und füg die ausgegebene Zeile in deine `.env` ein:
+
+  ```sh
+  docker compose run --rm ebbot python3 bot.py hash-password    # oder: python3 bot.py hash-password
+  ```
+
+  Sind beide gesetzt, zählt der Hash.
+- **Sicherheitsprotokoll.** Das Dashboard listet die letzten Anmeldungen, falschen Passwörter, Sperren und
+  Änderungen auf und hat einen Button, der alle Geräte abmeldet. Acht falsche Passwörter sperren eine
+  Adresse für zehn Minuten.
+- **Sitzungen.** Von jedem Sitzungstoken wird nur ein Hash gespeichert, mit der Datenbank allein kann sich
+  also niemand anmelden.
+- **Umstieg von einer älteren Version?** Der erste Start übernimmt `bot.json`, `ebay.json` und
+  `categories.json` in die Datenbank und benennt sie in `*.imported` um. `EBAY_DATA_DIR` wird nur noch für
+  diese Übernahme gelesen. Mit Docker liegen die Daten jetzt in einem Volume statt in `./data`: kopier deine
+  alten Dateien aus `./data` vor dem ersten Start in das Volume, wenn du sie behalten willst.
 
 ## Gut zu wissen
 

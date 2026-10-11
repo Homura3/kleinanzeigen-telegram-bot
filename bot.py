@@ -9,6 +9,7 @@ import os
 import random
 import re
 import secrets
+import sqlite3
 import struct
 import sys
 import threading
@@ -30,29 +31,36 @@ MAX_LINKS = int(os.environ.get("MAX_LINKS", "5"))
 MAX_USERS = int(os.environ.get("MAX_USERS", "50"))
 MAX_PER_CYCLE = int(os.environ.get("MAX_PER_CYCLE", "10"))
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+# The dashboard password can be given as a hash instead, so that nobody can read it out of the app's
+# settings: `python3 bot.py hash-password` makes one. If both are set, the hash is the one that counts.
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").strip()
+# A copy of the database is put aside once a day; this many are kept (0 = no copies).
+BACKUP_DAYS = int(os.environ.get("BACKUP_DAYS", "7"))
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 # Alerts are deleted from the chats and the dashboard after this many hours (0 = keep them).
 # Telegram only lets a bot delete its messages for 48 hours, so keep this below 48.
 ALERT_HOURS = int(os.environ.get("ALERT_HOURS", "24"))
 # New people have to be approved on the dashboard before they can use the bot (0 = open sign-up).
 APPROVAL = os.environ.get("APPROVAL", "1").strip().lower() not in ("0", "no", "off", "false")
-# eBay goes through eBay's official Browse API (their website blocks bots) and keeps its
-# searches and alert log in its own folder. It switches on once all three are set.
+# eBay goes through eBay's official Browse API (their website blocks bots). It switches on once both
+# keys are set. EBAY_DATA_DIR is only looked at once, to bring over what older versions saved there.
 EBAY_DIR = os.environ.get("EBAY_DATA_DIR", "")
 EBAY_APP_ID = os.environ.get("EBAY_APP_ID", "").strip()
 EBAY_CERT_ID = os.environ.get("EBAY_CERT_ID", "").strip()
 EBAY_INTERVAL = int(os.environ.get("EBAY_INTERVAL", "300"))
-EBAY_ON = bool(EBAY_DIR and EBAY_APP_ID and EBAY_CERT_ID)
+EBAY_ON = bool(EBAY_APP_ID and EBAY_CERT_ID)
 
 BASE = "https://www.kleinanzeigen.de"
 HOSTS = ("www.kleinanzeigen.de", "kleinanzeigen.de")
 API = "https://api.telegram.org/bot" + TOKEN
-DB = os.path.join(DATA_DIR, "bot.json")
+DB = os.path.join(DATA_DIR, "bot.db")     # everything the bot knows, in one SQLite database
 EBAY_BASE = "https://www.ebay.de"
 EBAY_HOSTS = ("www.ebay.de", "ebay.de")
 EBAY_API = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 EBAY_LOGIN = "https://api.ebay.com/identity/v1/oauth2/token"
-EBAY_DB = os.path.join(EBAY_DIR, "ebay.json")
+# where versions before the database kept their data; read once and then put away
+OLD_FILES = {"bot": os.path.join(DATA_DIR, "bot.json"), "categories": os.path.join(DATA_DIR, "categories.json"),
+             "ebay": os.path.join(EBAY_DIR, "ebay.json") if EBAY_DIR else ""}
 SITES = ("ka", "ebay") if EBAY_ON else ("ka",)
 SITE_NAMES = {"ka": "Kleinanzeigen", "ebay": "eBay"}
 EVERY = {"ka": INTERVAL, "ebay": EBAY_INTERVAL}     # seconds between scans
@@ -126,7 +134,7 @@ lock = threading.Lock()
 state = {"offset": 0, "users": {}, "requests": {}, "declined": {}, "events": [], "messages": [], "settings": {}, "profile": {},
          "sessions": {}, "csrf": "",
          "last_scan": 0, "last_error": "", "alerts_total": 0}
-# eBay's side of things, saved apart from the rest in EBAY_DIR
+# eBay's side of things
 ebay = {"users": {}, "events": [], "calls": {}, "last_scan": 0, "last_error": "", "alerts_total": 0}
 ebay_token = {"value": "", "expires": 0}
 scan_event = threading.Event()
@@ -185,33 +193,259 @@ def read(path):
         return {}
 
 
-def write(path, data):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    os.replace(tmp, path)
+# ---------- the database ----------
+# While it runs, the bot works on the dictionaries above. save() carries what changed over into the
+# database in one transaction, so the file on disk is never half-written, and load() reads it all back.
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta     (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS users    (cid TEXT PRIMARY KEY, name TEXT NOT NULL, paused INTEGER NOT NULL, lang TEXT,
+                                     min_price INTEGER NOT NULL, exclude TEXT NOT NULL, extra TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS searches (cid TEXT NOT NULL, site TEXT NOT NULL, position INTEGER NOT NULL, url TEXT NOT NULL,
+                                     seen TEXT NOT NULL, PRIMARY KEY (cid, site, position));
+CREATE TABLE IF NOT EXISTS accounts (cid TEXT NOT NULL, site TEXT NOT NULL, alerts INTEGER NOT NULL, sent TEXT NOT NULL,
+                                     PRIMARY KEY (cid, site));
+CREATE TABLE IF NOT EXISTS events   (site TEXT NOT NULL, n INTEGER NOT NULL, t INTEGER, cid TEXT, title TEXT, price TEXT,
+                                     link TEXT, PRIMARY KEY (site, n));
+CREATE TABLE IF NOT EXISTS messages (chat TEXT NOT NULL, message_id INTEGER NOT NULL, t INTEGER NOT NULL,
+                                     PRIMARY KEY (chat, message_id));
+CREATE TABLE IF NOT EXISTS requests (cid TEXT PRIMARY KEY, name TEXT, username TEXT, text TEXT, t INTEGER, lang TEXT);
+CREATE TABLE IF NOT EXISTS declined (cid TEXT PRIMARY KEY, name TEXT, t INTEGER);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions (key TEXT PRIMARY KEY, expires INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS audit    (id INTEGER PRIMARY KEY AUTOINCREMENT, t INTEGER NOT NULL, ip TEXT, what TEXT NOT NULL,
+                                     detail TEXT);
+"""
+# the tables save() looks after: their columns, and how many of them (from the left) make up the key
+TABLES = {"meta": (("key", "value"), 1),
+          "users": (("cid", "name", "paused", "lang", "min_price", "exclude", "extra"), 1),
+          "searches": (("cid", "site", "position", "url", "seen"), 3),
+          "accounts": (("cid", "site", "alerts", "sent"), 2),
+          "events": (("site", "n", "t", "cid", "title", "price", "link"), 2),
+          "messages": (("chat", "message_id", "t"), 2),
+          "requests": (("cid", "name", "username", "text", "t", "lang"), 1),
+          "declined": (("cid", "name", "t"), 1),
+          "settings": (("key", "value"), 1),
+          "sessions": (("key", "expires"), 1)}
+# what a user's record holds in memory that has a column or a table of its own
+USER_FIELDS = ("name", "paused", "lang", "min_price", "exclude", "links", "alerts", "sent")
+db = {"con": None, "rows": {}}      # the open database, and its rows as they were last written
+db_lock = threading.Lock()
+
+
+def pack(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def unpack(text, fallback):
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return fallback
+    return value if isinstance(value, type(fallback)) else fallback
+
+
+def open_db():
+    """Open the database, creating it if need be. Nobody but the bot's own user may read the file."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    con = sqlite3.connect(DB, check_same_thread=False, timeout=30)
+    con.executescript(SCHEMA)
+    try:
+        os.chmod(DB, 0o600)
+    except OSError as error:
+        log("could not make the database private: " + safe(error))
+    db["con"] = con
+    db["rows"] = {table: {row[:keys]: row for row in con.execute("SELECT %s FROM %s" % (", ".join(columns), table))}
+                  for table, (columns, keys) in TABLES.items()}
+
+
+def rows_now():
+    """Everything in memory, as the rows the database should hold: {table: {key: row}}."""
+    rows = {table: {} for table in TABLES}
+    meta = {"version": 1, "offset": state["offset"], "csrf": state["csrf"], "profile": state.get("profile", {}),
+            "calls": ebay["calls"]}
+    if categories["tree"]:
+        meta["categories"] = {"t": categories["t"], "tree": categories["tree"]}
+    for site, log_ in (("ka", state), ("ebay", ebay)):
+        for field in ("last_scan", "last_error", "alerts_total"):
+            meta[field + ":" + site] = log_.get(field)
+        for n, ev in enumerate(log_["events"]):
+            rows["events"][(site, n)] = (site, n, ev.get("t"), ev.get("cid"), ev.get("title"), ev.get("price"), ev.get("link"))
+    for key, value in meta.items():
+        rows["meta"][(key,)] = (key, pack(value))
+    for cid, user in state["users"].items():
+        extra = {key: value for key, value in user.items() if key not in USER_FIELDS}
+        rows["users"][(cid,)] = (cid, str(user.get("name", "")), int(bool(user.get("paused"))), user.get("lang"),
+                                 int(user.get("min_price") or 0), pack(user.get("exclude", [])), pack(extra))
+        for site, acc in (("ka", user), ("ebay", ebay["users"].get(cid))):
+            if acc is None:
+                continue
+            for position, link in enumerate(acc.get("links", [])):
+                rows["searches"][(cid, site, position)] = (cid, site, position, link["url"], pack(link.get("seen", [])))
+            if acc.get("alerts") or acc.get("sent"):
+                rows["accounts"][(cid, site)] = (cid, site, int(acc.get("alerts", 0)), pack(acc.get("sent", [])))
+    for m in state["messages"]:
+        rows["messages"][(str(m["c"]), int(m["m"]))] = (str(m["c"]), int(m["m"]), int(m["t"]))
+    for cid, r in state["requests"].items():
+        rows["requests"][(cid,)] = (cid, r.get("name"), r.get("username"), r.get("text"), r.get("t"), r.get("lang"))
+    for cid, r in state["declined"].items():
+        rows["declined"][(cid,)] = (cid, r.get("name"), r.get("t"))
+    for key, value in state.get("settings", {}).items():
+        rows["settings"][(key,)] = (key, pack(value))
+    for key, expires in state["sessions"].items():
+        rows["sessions"][(key,)] = (key, int(expires))
+    return rows
+
+
+def save():
+    """Write what changed since the last save to the database. Call with the lock held."""
+    now = rows_now()
+    with db_lock:
+        con = db["con"]
+        if con is None:
+            return
+        try:
+            with con:       # one transaction: all of it lands, or none of it
+                for table, (columns, keys) in TABLES.items():
+                    before, after = db["rows"].get(table, {}), now[table]
+                    gone = [key for key in before if key not in after]
+                    changed = [row for key, row in after.items() if before.get(key) != row]
+                    if gone:
+                        con.executemany("DELETE FROM %s WHERE %s" % (table, " AND ".join(
+                            column + " = ?" for column in columns[:keys])), gone)
+                    if changed:
+                        con.executemany("INSERT OR REPLACE INTO %s (%s) VALUES (%s)" % (
+                            table, ", ".join(columns), ", ".join("?" for _ in columns)), changed)
+            db["rows"] = now
+        except sqlite3.Error as error:
+            log("could not save to the database: " + safe(error))      # the next save tries again
 
 
 def load():
-    data = read(DB)
+    """Read everything from the database - or, the first time, from the files older versions kept."""
+    open_db()
+    rows = db["rows"]
+    if not rows["meta"]:
+        import_old()
+    else:
+        meta = {key[0]: row[1] for key, row in rows["meta"].items()}
+        state["offset"] = unpack(meta.get("offset"), 0)
+        state["csrf"] = unpack(meta.get("csrf"), "")
+        state["profile"] = unpack(meta.get("profile"), {})
+        ebay["calls"] = unpack(meta.get("calls"), {})
+        saved = unpack(meta.get("categories"), {})      # the category list, so names show right away
+        if isinstance(saved.get("tree"), list):
+            categories.update(t=saved.get("t", 0), tree=saved["tree"])
+        for site, log_ in (("ka", state), ("ebay", ebay)):
+            log_["last_scan"] = unpack(meta.get("last_scan:" + site), 0)
+            log_["last_error"] = unpack(meta.get("last_error:" + site), "")
+            log_["alerts_total"] = unpack(meta.get("alerts_total:" + site), 0)
+            log_["events"] = [{"t": t, "cid": cid, "title": title, "price": price, "link": link}
+                              for key, (_, _, t, cid, title, price, link) in sorted(rows["events"].items()) if key[0] == site]
+        state["users"], ebay["users"] = {}, {}
+        for cid, name, paused, lang, min_price, exclude, extra in rows["users"].values():
+            user = dict(unpack(extra, {}), name=name, paused=bool(paused), links=[])
+            if lang:
+                user["lang"] = lang
+            if min_price:
+                user["min_price"] = min_price
+            if unpack(exclude, []):
+                user["exclude"] = unpack(exclude, [])
+            state["users"][cid] = user
+
+        def acc(cid, site):
+            if site == "ka":
+                return state["users"].get(cid)
+            return ebay["users"].setdefault(cid, {"links": [], "sent": [], "alerts": 0}) if cid in state["users"] else None
+
+        for _, (cid, site, _, url, seen) in sorted(rows["searches"].items()):
+            if acc(cid, site) is not None:
+                acc(cid, site)["links"].append({"url": url, "seen": unpack(seen, [])})
+        for cid, site, alerts, sent in rows["accounts"].values():
+            if acc(cid, site) is not None:
+                acc(cid, site).update(alerts=alerts, sent=unpack(sent, []))
+        state["messages"] = [{"c": chat, "m": message_id, "t": t}
+                             for chat, message_id, t in sorted(rows["messages"].values(), key=lambda row: row[2])]
+        state["requests"] = {cid: {key: value for key, value in zip(TABLES["requests"][0][1:], rest) if value is not None}
+                             for cid, *rest in rows["requests"].values()}
+        state["declined"] = {cid: {"name": name, "t": t} for cid, name, t in rows["declined"].values()}
+        state["settings"] = {key: json.loads(value) for key, value in rows["settings"].values()}
+        state["sessions"] = {key: expires for key, expires in rows["sessions"].values()}
+    global CSRF     # kept across restarts, so a page that is open on a phone keeps working after an update
+    CSRF = state["csrf"] = state["csrf"] or CSRF
+    apply_settings()
+
+
+def import_old():
+    """Bring over the data of a version that kept it in JSON files, then put those files away."""
+    data = read(OLD_FILES["bot"])
     state["offset"] = data.get("offset", 0)
     state["users"] = data.get("users", {})
     for key in ("requests", "declined", "events", "messages", "settings", "profile", "sessions", "csrf",
                 "last_scan", "last_error", "alerts_total"):
         if key in data:
             state[key] = data[key]
-    global CSRF     # kept across restarts, so a page that is open on a phone keeps working after an update
-    CSRF = state["csrf"] = state["csrf"] or CSRF
-    if EBAY_ON:
-        data = read(EBAY_DB)
-        for key in ebay:
-            if key in data:
-                ebay[key] = data[key]
-    saved = read(CAT_FILE)      # the category list read from Kleinanzeigen earlier, so names show right away
+    data = read(OLD_FILES["ebay"]) if OLD_FILES["ebay"] else {}
+    for key in ebay:
+        if key in data:
+            ebay[key] = data[key]
+    saved = read(OLD_FILES["categories"])
     if isinstance(saved.get("tree"), list):
         categories.update(t=saved.get("t", 0), tree=saved["tree"])
-    apply_settings()
+    save()
+    for path in OLD_FILES.values():
+        if path and os.path.exists(path):
+            try:    # kept, in case something has to be looked up - but no longer for everyone to read
+                os.chmod(path, 0o600)
+                os.replace(path, path + ".imported")
+                log("imported %s into the database; the file is now %s.imported" % (path, os.path.basename(path)))
+            except OSError as error:
+                log("imported %s, but could not put the file away: %s" % (path, safe(error)))
+
+
+def backup():
+    """Put a copy of the database aside once a day, and keep the last BACKUP_DAYS of them."""
+    if not BACKUP_DAYS or db["con"] is None:
+        return
+    folder = os.path.join(DATA_DIR, "backups")
+    target = os.path.join(folder, time.strftime("bot-%Y-%m-%d.db"))
+    if os.path.exists(target):
+        return
+    os.makedirs(folder, exist_ok=True)
+    copy = sqlite3.connect(target)
+    try:
+        with db_lock:
+            db["con"].backup(copy)
+    finally:
+        copy.close()
+    os.chmod(target, 0o600)
+    for name in sorted(n for n in os.listdir(folder) if re.fullmatch(r"bot-\d{4}-\d\d-\d\d\.db", n))[:-BACKUP_DAYS]:
+        os.remove(os.path.join(folder, name))
+    log("saved a copy of the database as backups/" + os.path.basename(target))
+
+
+def audit(what, ip="", detail=""):
+    """Note down a sign-in, a failed one or a change made on the dashboard."""
+    with db_lock:
+        con = db["con"]
+        if con is None:
+            return
+        try:
+            with con:
+                con.execute("INSERT INTO audit (t, ip, what, detail) VALUES (?, ?, ?, ?)",
+                            (int(time.time()), str(ip)[:60], what, str(detail)[:200]))
+                con.execute("DELETE FROM audit WHERE id <= (SELECT MAX(id) FROM audit) - 500")
+        except sqlite3.Error as error:
+            log("could not write the security log: " + safe(error))
+
+
+def audit_rows(limit):
+    """The latest entries of the security log, newest first: (time, address, what, detail)."""
+    with db_lock:
+        try:
+            return db["con"].execute("SELECT t, ip, what, detail FROM audit ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        except (sqlite3.Error, AttributeError):
+            return []
 
 
 def apply_settings():
@@ -225,15 +459,6 @@ def apply_settings():
 
 def minutes(seconds):
     return max(1, seconds // 60)
-
-
-def save():
-    write(DB, state)
-    if EBAY_ON:
-        try:
-            write(EBAY_DB, ebay)
-        except OSError as error:
-            log("could not save eBay data: " + safe(error))
 
 
 # ---------- Telegram ----------
@@ -1237,7 +1462,6 @@ E_WORDS, E_CATEGORY, E_BUDGET, E_PLACE = "🔤 Search words", "📂 Category", "
 E_DIRECT, E_KIND, E_LINK, E_DONE = "🛒 Direkt kaufen", "🏷 Kind of listing", "🔗 Paste a new link", "✅ Done"
 SKIP = re.compile(r"skip|all|alle|alles|any|egal|none|no|nein|weiter|überspringen|-")
 CATEGORY_DAYS = 7       # how long the category list read from Kleinanzeigen is kept
-CAT_FILE = os.path.join(DATA_DIR, "categories.json")
 categories = {"t": 0, "tree": []}
 HOW_DIRECT = ("• <i>Direkt kaufen only</i> - just the ads you can buy and pay for right on Kleinanzeigen, "
               "with shipping and buyer protection. Fewer ads, no haggling over pickup.\n"
@@ -1286,10 +1510,6 @@ def category_tree():
     Returns [] if the list cannot be had - the builder then simply skips the category question.
     """
     now = time.time()
-    if not categories["tree"] and not categories["t"]:
-        saved = read(CAT_FILE)
-        if isinstance(saved.get("tree"), list):
-            categories.update(t=saved.get("t", 0), tree=saved["tree"])
     if categories["tree"] and now - categories["t"] < CATEGORY_DAYS * 86400:
         return categories["tree"]
     if now - categories.get("tried", 0) < 3600:        # a failed read is not repeated right away
@@ -1316,7 +1536,8 @@ def category_tree():
         if len(tree) < 5:
             raise RuntimeError("only %d categories found" % len(tree))
         categories.update(t=now, tree=tree)
-        write(CAT_FILE, {"t": now, "tree": tree})
+        with lock:
+            save()
         log("read %d categories from Kleinanzeigen" % sum(1 + len(c["subs"]) for c in tree))
     except Exception as error:
         log("could not read the category list: " + safe(error))
@@ -2524,6 +2745,26 @@ def login_page(nonce, problem=""):
             "<p>" + other_lang("/login") + "</p></form></main></body></html>")
 
 
+def hash_password(password, salt=None):
+    """A password as 'scrypt:salt:hash' - what ADMIN_PASSWORD_HASH holds. It cannot be turned back."""
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2 ** 14, r=8, p=1, dklen=32)
+    return "scrypt:%s:%s" % (base64.urlsafe_b64encode(salt).decode(), base64.urlsafe_b64encode(digest).decode())
+
+
+def password_ok(password):
+    """True if this is the dashboard password."""
+    password = str(password)[:1000]
+    if ADMIN_PASSWORD_HASH:
+        try:
+            kind, salt, _ = ADMIN_PASSWORD_HASH.split(":")
+            return kind == "scrypt" and hmac.compare_digest(
+                hash_password(password, base64.urlsafe_b64decode(salt)), ADMIN_PASSWORD_HASH)
+        except ValueError:
+            return False
+    return bool(ADMIN_PASSWORD) and hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode())
+
+
 def session_key(token):
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -2534,7 +2775,7 @@ def session_ok(token):
 
 
 def session_start():
-    """Sign a browser in. Only a hash of the token is kept, so the data file cannot be used to sign in."""
+    """Sign a browser in. Only a hash of the token is kept, so the database cannot be used to sign in."""
     token = secrets.token_urlsafe(32)
     with lock:
         now = time.time()
@@ -2549,6 +2790,35 @@ def session_end(token):
     with lock:
         if state["sessions"].pop(session_key(token), None):
             save()
+
+
+def sessions_end():
+    """Sign every browser out."""
+    with lock:
+        state["sessions"] = {}
+        save()
+
+
+# what the security log holds, and how the dashboard words it
+AUDIT = {"login": "Signed in", "badlogin": "Wrong password", "lockout": "Locked out after too many tries",
+         "logout": "Signed out", "logoutall": "Signed out everywhere", "action": "Change"}
+
+
+def security_card():
+    """Who signed in and what was changed lately, and the way to sign every device out."""
+    e = html.escape
+    rows = "".join('<li class="row"><span>%s%s <span class="hint">%s &middot; %s</span></span></li>'
+                   % (e(T(AUDIT.get(what, what))), ": " + e(detail) if detail else "", e(ip or "-"), ago(t))
+                   for t, ip, what, detail in audit_rows(12)) or '<li class="empty">%s</li>' % T("Nothing here yet.")
+    if ADMIN_PASSWORD_HASH:
+        password = T("The dashboard password is kept as a hash.")
+    else:
+        password = (T("The dashboard password is in the app settings as plain text. <code>python3 bot.py hash-password</code> "
+                    "turns it into a hash for <code>ADMIN_PASSWORD_HASH</code>."))
+    return ("<h2>%s</h2><ul class='card feed'>" % T("Security") + rows + '<li class="hint">%s</li>' % password +
+            '<li class="row"><span class="hint">%s</span>' % T("Signed in on a device you no longer use?") +
+            form("logoutall", '<button class="btn bad">%s</button>' % T("Sign out everywhere"),
+                 ask=T("Sign out of the dashboard on every device?")) + "</li></ul>")
 
 
 def span(ts):
@@ -2771,9 +3041,8 @@ def site_cards(now):
     for site in ("ka", "ebay"):
         if site not in SITES:
             cards.append(T('<article class="card site"><div class="shead"><b>eBay</b><span class="badge idle">Off</span></div>'
-                         '<p class="hint">eBay needs a free key pair from developer.ebay.com. Add %s<code>EBAY_APP_ID</code> '
-                         'and <code>EBAY_CERT_ID</code> to the app settings and it switches on.</p></article>')
-                         % ("" if EBAY_DIR else "<code>EBAY_DATA_DIR</code>, "))
+                         '<p class="hint">eBay needs a free key pair from developer.ebay.com. Add <code>EBAY_APP_ID</code> '
+                         'and <code>EBAY_CERT_ID</code> to the app settings and it switches on.</p></article>'))
             continue
         log_, h = book(site), health.get(site, {})
         if log_.get("last_error"):
@@ -2794,7 +3063,7 @@ def site_cards(now):
         if site == "ebay":
             used = ebay["calls"].get("n", 0) if ebay["calls"].get("day") == time.strftime("%Y-%m-%d") else 0
             rows.append((T("API calls today"), T("<dd>%d of about 5,000</dd>") % used))
-        rows.append((T("Data file"), "<dd><code>%s</code></dd>" % html.escape(EBAY_DB if site == "ebay" else DB)))
+        rows.append((T("Data file"), "<dd><code>%s</code></dd>" % html.escape(DB)))
         cards.append('<article class="card site"><div class="shead"><b>%s</b>%s</div><dl class="kv">%s</dl></article>'
                      % (SITE_NAMES[site], badge, "".join("<div><dt>%s</dt>%s</div>" % row for row in rows)))
     return "".join(cards)
@@ -2915,7 +3184,7 @@ def page(nonce, flash=None):
             "<div class='cols'><section data-sec='users'><h2>Users <span class='count'>%d</span></h2>") % len(users) + cards +
             T("</section><aside class='side'><div data-sec='settings'><h2>Settings</h2>") + settings +
             "<div class='signout'>" + other_lang("/") + " " + form("logout", T('<button class="btn">Sign out</button>')) +
-            "</div>" + banned + T("</div>"
+            "</div>" + security_card() + banned + T("</div>"
             "<div data-sec='message'><h2>Send a message</h2>") + compose + T("</div>"
             "<div data-sec='alerts'><h2>Latest alerts%s</h2><ul class='card feed'>") % (T(" <span class='count'>last %d h</span>") % ALERT_HOURS if ALERT_HOURS else "") + feed + T("</ul></div></aside></div>"
             "<footer>Up to %d searches per user%s &middot; filters and pausing are set per user</footer>")
@@ -3179,8 +3448,11 @@ def login_failed(ip):
             fails.clear()
         entry = fails.setdefault(ip, [0, time.time()])
         entry[0] += 1
-        if entry[0] == LOCK_AFTER:
-            log("dashboard: %s locked out after %d failed logins" % (ip, LOCK_AFTER))
+        locked = entry[0] == LOCK_AFTER
+    audit("badlogin", ip)
+    if locked:
+        log("dashboard: %s locked out after %d failed logins" % (ip, LOCK_AFTER))
+        audit("lockout", ip)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3219,8 +3491,7 @@ class Handler(BaseHTTPRequestHandler):
                 login, _, password = base64.b64decode(header[6:]).decode("utf-8").partition(":")
             except Exception:
                 login = password = ""
-            if (hmac.compare_digest(login.encode(), b"admin") and
-                    hmac.compare_digest(password.encode(), ADMIN_PASSWORD.encode())):
+            if hmac.compare_digest(login.encode(), b"admin") and password_ok(password):
                 with web_lock:
                     fails.pop(ip, None)
                 return True
@@ -3250,8 +3521,10 @@ class Handler(BaseHTTPRequestHandler):
         if location:
             self.send_header("Location", location)
         if cookie is not None:
-            self.send_header("Set-Cookie", "%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Strict"
-                             % (COOKIE, cookie, SESSION_DAYS * 86400 if cookie else 0))
+            # behind a proxy that speaks HTTPS, the browser is told never to send the cookie over plain HTTP
+            secure = "; Secure" if self.headers.get("X-Forwarded-Proto", "").lower() == "https" else ""
+            self.send_header("Set-Cookie", "%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Strict%s"
+                             % (COOKIE, cookie, SESSION_DAYS * 86400 if cookie else 0, secure))
         if lang:
             self.send_header("Set-Cookie", "%s_lang=%s; Path=/; Max-Age=31536000; SameSite=Lax" % (COOKIE, lang))
         self.end_headers()
@@ -3306,10 +3579,11 @@ class Handler(BaseHTTPRequestHandler):
         form_data = self.form()
         if form_data is None:
             return
-        if hmac.compare_digest(form_data.get("password", "").encode(), ADMIN_PASSWORD.encode()):
+        if password_ok(form_data.get("password", "")):
             with web_lock:
                 fails.pop(ip, None)
             log("dashboard: %s signed in" % ip)
+            audit("login", ip)
             return self.reply(303, "", location="/", cookie=session_start())
         login_failed(ip)
         time.sleep(1)
@@ -3328,14 +3602,19 @@ class Handler(BaseHTTPRequestHandler):
         if not hmac.compare_digest(form_data.get("csrf", "").encode(), CSRF.encode()):
             self.reply(403, T("Page expired - go back and reload it."), "text/plain; charset=utf-8")
             return
-        if form_data.get("op") == "logout":
-            session_end(self.token())
+        ip, op = self.client_address[0], form_data.get("op", "")
+        if op in ("logout", "logoutall"):
+            session_end(self.token()) if op == "logout" else sessions_end()
+            audit(op, ip)
             return self.reply(303, "", location="/login", cookie="")
         try:
             result = do_action(form_data)
         except Exception as error:
             log("dashboard action error: " + safe(error))
             result = (False, T("Something went wrong - check the bot log."))
+        if op != "scan":
+            audit("action", ip, " ".join(part for part in (re.sub(r"[^a-z]", "", op)[:20], form_data.get("cid", "")[:20],
+                                                           "" if result[0] else "(failed)") if part))
         key = secrets.token_urlsafe(8)
         with web_lock:
             while len(flashes) >= 50:
@@ -3353,6 +3632,20 @@ def run_dashboard():
     server.daemon_threads = True
     log("dashboard listening on port %d" % DASHBOARD_PORT)
     server.serve_forever()
+
+
+def print_hash():
+    """`bot.py hash-password`: ask for a password and print the line that goes into the app's settings."""
+    import getpass
+    if sys.stdin.isatty():
+        password = getpass.getpass("Dashboard password: ")
+        if getpass.getpass("Once more: ") != password:
+            sys.exit("Those two were not the same.")
+    else:
+        password = sys.stdin.readline().rstrip("\r\n")
+    if len(password) < 10:
+        sys.exit("Use at least 10 characters.")
+    print("ADMIN_PASSWORD_HASH=" + hash_password(password))
 
 
 # ---------- German ----------
@@ -4537,14 +4830,6 @@ DE = {
         "Meldungen gesendet",
     "Data file":
         "Datendatei",
-    "<article class=\"card site\"><div class=\"shead\"><b>eBay</b><span class=\"badge "
-    "idle\">Off</span></div><p class=\"hint\">eBay needs a free key pair from developer.ebay.com. Add "
-    "%s<code>EBAY_APP_ID</code> and <code>EBAY_CERT_ID</code> to the app settings and it switches "
-    "on.</p></article>":
-        "<article class=\"card site\"><div class=\"shead\"><b>eBay</b><span class=\"badge "
-        "idle\">Aus</span></div><p class=\"hint\">eBay braucht ein kostenloses Schlüsselpaar von "
-        "developer.ebay.com. Trag %s<code>EBAY_APP_ID</code> und <code>EBAY_CERT_ID</code> in die "
-        "App-Einstellungen ein, dann schaltet es sich ein.</p></article>",
     "Blocked, backing off":
         "Blockiert, wartet ab",
     "Needs attention":
@@ -4924,27 +5209,65 @@ DE = {
         "%s Abruf fehlgeschlagen (...%s): %s",
     "%s scan error: %s":
         "%s Scan-Fehler: %s",
+    "<article class=\"card site\"><div class=\"shead\"><b>eBay</b><span class=\"badge "
+    "idle\">Off</span></div><p class=\"hint\">eBay needs a free key pair from developer.ebay.com. Add "
+    "<code>EBAY_APP_ID</code> and <code>EBAY_CERT_ID</code> to the app settings and it switches "
+    "on.</p></article>":
+        "<article class=\"card site\"><div class=\"shead\"><b>eBay</b><span class=\"badge "
+        "idle\">Aus</span></div><p class=\"hint\">eBay braucht ein kostenloses Schlüsselpaar von "
+        "developer.ebay.com. Trag <code>EBAY_APP_ID</code> und <code>EBAY_CERT_ID</code> in die "
+        "App-Einstellungen ein, dann schaltet es sich ein.</p></article>",
+    "Signed in":
+        "Angemeldet",
+    "Wrong password":
+        "Falsches Passwort",
+    "Locked out after too many tries":
+        "Nach zu vielen Versuchen gesperrt",
+    "Signed out":
+        "Abgemeldet",
+    "Signed out everywhere":
+        "Überall abgemeldet",
+    "Change":
+        "Änderung",
+    "Nothing here yet.":
+        "Hier ist noch nichts.",
+    "Security":
+        "Sicherheit",
+    "The dashboard password is kept as a hash.":
+        "Das Dashboard-Passwort ist als Hash hinterlegt.",
+    "The dashboard password is in the app settings as plain text. <code>python3 bot.py "
+    "hash-password</code> turns it into a hash for <code>ADMIN_PASSWORD_HASH</code>.":
+        "Das Dashboard-Passwort steht als Klartext in den App-Einstellungen. <code>python3 bot.py "
+        "hash-password</code> macht daraus einen Hash für <code>ADMIN_PASSWORD_HASH</code>.",
+    "Signed in on a device you no longer use?":
+        "Auf einem Gerät angemeldet, das du nicht mehr nutzt?",
+    "Sign out everywhere":
+        "Überall abmelden",
+    "Sign out of the dashboard on every device?":
+        "Auf allen Geräten vom Dashboard abmelden?",
 }
 
 # ---------- end of German ----------
 
 
 def main():
+    if sys.argv[1:2] == ["hash-password"]:
+        return print_hash()
     if not TOKEN:
         sys.exit("Set the TOKEN environment variable first.")
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.umask(0o077)     # whatever the bot writes is for its own user only
     load()
     threading.Thread(target=poll_loop, daemon=True).start()
-    if ADMIN_PASSWORD:
-        if len(ADMIN_PASSWORD) < 10:
+    if ADMIN_PASSWORD or ADMIN_PASSWORD_HASH:
+        if not ADMIN_PASSWORD_HASH and len(ADMIN_PASSWORD) < 10:
             log("warning: ADMIN_PASSWORD is short - use at least 10 characters")
         threading.Thread(target=run_dashboard, daemon=True).start()
     else:
-        log("dashboard is off (set ADMIN_PASSWORD to turn it on)")
+        log("dashboard is off (set ADMIN_PASSWORD or ADMIN_PASSWORD_HASH to turn it on)")
     log("bot started, %d users, checking %s" % (len(state["users"]), ", ".join(
         "%s every %d s" % (SITE_NAMES[site], EVERY[site]) for site in SITES)))
-    if not EBAY_ON and (EBAY_DIR or EBAY_APP_ID or EBAY_CERT_ID):
-        log("eBay is off: it needs EBAY_DATA_DIR, EBAY_APP_ID and EBAY_CERT_ID")
+    if not EBAY_ON and (EBAY_APP_ID or EBAY_CERT_ID):
+        log("eBay is off: it needs both EBAY_APP_ID and EBAY_CERT_ID")
     set_profile()
     for site in SITES:
         health[site] = {"streak": 0, "level": 0, "alerted": False, "due": 0}
@@ -4983,6 +5306,10 @@ def main():
             tidy_up()
         except Exception as error:
             log("tidy up error: " + safe(error))
+        try:
+            backup()
+        except Exception as error:
+            log("backup error: " + safe(error))
         scan_event.wait(max(1, min(h["due"] for h in health.values()) - time.time()))
 
 

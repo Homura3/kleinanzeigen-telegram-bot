@@ -13,7 +13,7 @@ messages you the moment a new ad shows up. Optionally it watches ebay.de too. It
 
 🇩🇪 [Deutsche Anleitung](README.de.md)
 
-It is one Python file with two dependencies, keeps its data in plain JSON files and runs fine on a
+It is one Python file with two dependencies, keeps its data in a single SQLite database and runs fine on a
 Raspberry Pi, a NAS or any small server.
 
 ![ebBot in Telegram: the /about message and new-ad alerts](docs/telegram.webp)
@@ -37,6 +37,9 @@ Raspberry Pi, a NAS or any small server.
   your searches is only sent once.
 - **Admin dashboard.** A password-protected web page to approve people, look at users and searches,
   and change the bot's settings. It can be added to a phone's home screen.
+- **Careful with your data.** Everything sits in one database file that only the bot's own user can read,
+  with a copy put aside every day. The dashboard password can be stored as a hash, and a security log shows
+  sign-ins, failed attempts and changes.
 - **Looks after itself.** If scans start failing or the site blocks the bot, it backs off and warns
   the admin, then says when things work again.
 - **English and German.** Everyone picks their own language with `/language`. New users start in the
@@ -80,7 +83,8 @@ cp .env.example .env      # then fill in TOKEN, CHAT_ID and ADMIN_PASSWORD
 docker compose up -d --build
 ```
 
-The bot's data lands in `./data`. The dashboard is at `http://<your-server>:8080`.
+The bot's data lives in the Docker volume `ebbot-data`. The dashboard is at `http://<your-server>:8080`.
+The container runs as an unprivileged user on a read-only file system.
 
 ### Without Docker
 
@@ -105,7 +109,8 @@ has an admin.
 |---|---|---|
 | `TOKEN` | - | Bot token from @BotFather |
 | `CHAT_ID` | - | Telegram user ID of the admin |
-| `ADMIN_PASSWORD` | off | Password for the dashboard (10+ characters). Empty turns the dashboard off |
+| `ADMIN_PASSWORD` | off | Password for the dashboard (10+ characters). Without a password the dashboard is off |
+| `ADMIN_PASSWORD_HASH` | - | The same password as a hash, so it is not readable in your settings. See [Security](#security) |
 | `ALLOWED_IDS` | - | User IDs that may use the bot without approval, comma-separated |
 | `APPROVAL` | `1` | New people need the admin's approval. `0` opens sign-up to everyone |
 | `INTERVAL` | `600` | Seconds between Kleinanzeigen scans |
@@ -114,14 +119,35 @@ has an admin.
 | `MAX_PER_CYCLE` | `10` | Most alerts sent per search in one scan |
 | `ALERT_HOURS` | `24` | Hours until alerts are deleted from the chats. `0` keeps them; Telegram's limit is 48 |
 | `LANGUAGE` | `en` | Fallback language, `en` or `de`: used for people whose Telegram app is in neither language and for anyone who has not picked one |
-| `DATA_DIR` | `~/ebbot` | Where the bot keeps its data (`/data` in the Docker image) |
+| `DATA_DIR` | `~/ebbot` | Folder for the database `bot.db` and its daily copies (`/data` in the Docker image) |
+| `BACKUP_DAYS` | `7` | How many daily copies of the database are kept in `backups/`. `0` makes none |
 | `DASHBOARD_PORT` | `8080` | Port of the dashboard |
-| `EBAY_DATA_DIR` | - | Folder for the eBay data, for example `/data/ebay` |
 | `EBAY_APP_ID`, `EBAY_CERT_ID` | - | Keys from [developer.ebay.com](https://developer.ebay.com) |
 | `EBAY_INTERVAL` | `300` | Seconds between eBay scans |
 
-eBay switches on once `EBAY_DATA_DIR`, `EBAY_APP_ID` and `EBAY_CERT_ID` are all set. Some of these
+eBay switches on once `EBAY_APP_ID` and `EBAY_CERT_ID` are both set. Some of these
 values can also be changed later on the dashboard.
+
+## Security
+
+- **One private database.** Users, searches, the alert log, settings and dashboard sessions are in
+  `bot.db` inside `DATA_DIR`. The bot creates it readable and writable for its own user only, and the same
+  goes for the daily copies in `backups/`.
+- **Hashed dashboard password.** Instead of `ADMIN_PASSWORD` you can set `ADMIN_PASSWORD_HASH`. Make the
+  hash with the bot itself and paste the line it prints into your `.env`:
+
+  ```sh
+  docker compose run --rm ebbot python3 bot.py hash-password    # or: python3 bot.py hash-password
+  ```
+
+  If both are set, the hash is the one that counts.
+- **Security log.** The dashboard lists the latest sign-ins, wrong passwords, lockouts and changes, and
+  has a button that signs every device out. Eight wrong passwords lock an address out for ten minutes.
+- **Sessions.** Only a hash of each session token is stored, so the database cannot be used to sign in.
+- **Coming from an older version?** The first start imports `bot.json`, `ebay.json` and `categories.json`
+  into the database and renames them to `*.imported`. `EBAY_DATA_DIR` is only read for that import.
+  With Docker, the data now lives in a volume instead of `./data`: copy your old `./data` files into the
+  volume before the first start if you want to keep them.
 
 ## Good to know
 
