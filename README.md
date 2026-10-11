@@ -9,7 +9,9 @@
 > **Deutsch:** Telegram-Bot, der dich sofort über neue Anzeigen auf Kleinanzeigen (und optional eBay.de) informiert.
 
 A small Telegram bot that watches searches on [kleinanzeigen.de](https://www.kleinanzeigen.de) and
-messages you the moment a new ad shows up. Optionally it watches ebay.de too.
+messages you the moment a new ad shows up. Optionally it watches ebay.de too. It speaks English and German.
+
+🇩🇪 [Deutsche Anleitung](README.de.md)
 
 It is one Python file with two dependencies, keeps its data in plain JSON files and runs fine on a
 Raspberry Pi, a NAS or any small server.
@@ -37,6 +39,8 @@ Raspberry Pi, a NAS or any small server.
   and change the bot's settings. It can be added to a phone's home screen.
 - **Looks after itself.** If scans start failing or the site blocks the bot, it backs off and warns
   the admin, then says when things work again.
+- **English and German.** Everyone picks their own language with `/language`. New users start in the
+  language of their Telegram app, and the dashboard has its own language switch.
 - **Optional eBay.** With a free eBay developer key the bot also watches ebay.de searches through
   eBay's official Browse API.
 
@@ -53,7 +57,11 @@ Raspberry Pi, a NAS or any small server.
 | `/exclude` | Skip ads with certain words |
 | `/minprice` | Skip ads below a price |
 | `/pause`, `/resume` | Mute and unmute alerts |
+| `/language` | Switch between English and German (`/deutsch`, `/english`) |
 | `/about`, `/help` | How the bot works, and help for each command |
+
+German spellings such as `/hilfe`, `/liste` and `/sprache` work too, and answers are understood in both
+languages (`ja` or `yes`, `egal` or `skip`).
 
 ## Setup
 
@@ -105,6 +113,7 @@ has an admin.
 | `MAX_USERS` | `50` | Most people the bot serves |
 | `MAX_PER_CYCLE` | `10` | Most alerts sent per search in one scan |
 | `ALERT_HOURS` | `24` | Hours until alerts are deleted from the chats. `0` keeps them; Telegram's limit is 48 |
+| `LANGUAGE` | `en` | Fallback language, `en` or `de`: used for people whose Telegram app is in neither language and for anyone who has not picked one |
 | `DATA_DIR` | `~/ebbot` | Where the bot keeps its data (`/data` in the Docker image) |
 | `DASHBOARD_PORT` | `8080` | Port of the dashboard |
 | `EBAY_DATA_DIR` | - | Folder for the eBay data, for example `/data/ebay` |
