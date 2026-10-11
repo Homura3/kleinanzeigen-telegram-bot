@@ -1,0 +1,11 @@
+services:
+  ebbot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
+    ports:
+      - "8080:8080"   # admin dashboard, only served when ADMIN_PASSWORD is set
