@@ -1,10 +1,27 @@
 # ebBot - Kleinanzeigen alerts in Telegram
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/)
+[![Docker](https://img.shields.io/badge/docker-compose-2496ED.svg?logo=docker&logoColor=white)](#with-docker-recommended)
+[![GitHub stars](https://img.shields.io/github/stars/Homura3/kleinanzeigen-telegram-bot?style=social)](https://github.com/Homura3/kleinanzeigen-telegram-bot/stargazers)
+
+> Never miss a deal again: new Kleinanzeigen ads straight to Telegram, filtered your way.
+> **Deutsch:** Telegram-Bot, der dich sofort über neue Anzeigen auf Kleinanzeigen (und optional eBay.de) informiert.
+
 A small Telegram bot that watches searches on [kleinanzeigen.de](https://www.kleinanzeigen.de) and
 messages you the moment a new ad shows up. Optionally it watches ebay.de too.
 
 It is one Python file with two dependencies, keeps its data in plain JSON files and runs fine on a
 Raspberry Pi, a NAS or any small server.
+
+![ebBot in Telegram: the /about message and new-ad alerts](docs/telegram.webp)
+
+<details>
+<summary>Admin dashboard</summary>
+
+![The ebBot admin dashboard](docs/dashboard.webp)
+
+</details>
 
 ## What it does
 
@@ -106,6 +123,11 @@ values can also be changed later on the dashboard.
 - **Not affiliated.** This is a private hobby project. It is not connected to or endorsed by
   Kleinanzeigen, eBay or Telegram, and automated access may be against a site's terms of use.
   Use it at your own risk.
+
+## Contributing
+
+Bug reports, ideas and pull requests are welcome. Open an [issue](https://github.com/Homura3/kleinanzeigen-telegram-bot/issues).
+If the bot is useful to you, a ⭐ helps other people find it.
 
 ## Licence
 
